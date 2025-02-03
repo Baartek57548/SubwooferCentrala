@@ -1,13 +1,12 @@
 #include <avr/wdt.h>         // Biblioteka watchdoga
+#include <LowPower.h>        // Biblioteka LowPower (dla Arduino AVR)
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
 // =====================
 // OPCJA DEBUGOWANIA
 // =====================
-// Aby włączyć debugowanie, ustaw poniższą linię na 1
 #define DEBUG 1
-
 #if DEBUG
   #define DEBUG_PRINT(x)     Serial.print(x)
   #define DEBUG_PRINTLN(x)   Serial.println(x)
@@ -19,50 +18,44 @@
 // =====================
 // DEFINICJE PINÓW
 // =====================
-// Pomiar napięcia akumulatora (dzielnik napięcia)
-const int BATTERY_PIN = A0;    
-// Wejście sygnału audio (po odpowiedniej obróbce – np. obwód prostowniczy)
-const int AUDIO_PIN = A1;      
+const int BATTERY_PIN = A0;         // Pomiar napięcia akumulatora (dzielnik napięcia)
+const int AUDIO_PIN = A1;           // Wejście sygnału audio
+const int SUBWOOFER_CTRL_PIN = 2;   // Sterowanie zasilaniem subwoofera
+const int ONE_WIRE_BUS = 3;         // Czujnik DS18B20 (1-Wire)
+const int FAN_PWM_PIN = 5;          // PWM sterujące wentylatorem
+const int TEMP_ALARM_PIN = 6;       // Sterowanie alarmem przegrzania
+const int LED_ALARM_PIN = 7;        // Dioda LED sygnalizująca tryb awaryjny
 
-// Wyjście sterujące zasilaniem subwoofera (np. przez przekaźnik lub tranzystor)
-const int SUBWOOFER_CTRL_PIN = 2;
-
-// Czujnik temperatury DS18B20 (1-Wire)
-const int ONE_WIRE_BUS = 3;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
-
-// Wyjście PWM sterujące wentylatorem (pin obsługujący PWM, np. D5)
-const int FAN_PWM_PIN = 5;
-
-// Wyjście alarmowe przy zbyt wysokiej temperaturze (np. sterowanie przekaźnikiem)
-const int TEMP_ALARM_PIN = 6;
-
-// Dioda LED sygnalizująca tryb awaryjny (np. D7)
-const int LED_ALARM_PIN = 7;
 
 // =====================
 // PARAMETRY POMIARÓW
 // =====================
-// Parametry dzielnika napięcia: przykładowo R1 = 20kΩ, R2 = 10kΩ
-// V_bat = V_measured * (R1+R2)/R2 = V_measured * 3
-const float VOLTAGE_DIVIDER_FACTOR = 3.0;
-const float BATTERY_LOW_THRESHOLD = 12.0;  // [V]
-
-// Parametry wykrywania sygnału audio
-const int AUDIO_THRESHOLD = 50;  // wartość z ADC – do dostosowania
+const float VOLTAGE_DIVIDER_FACTOR = 3.0;  // Współczynnik dzielnika napięcia (np. 20kΩ/10kΩ -> 3)
+const float BATTERY_LOW_THRESHOLD = 12.0;  // Próg niskiego napięcia [V]
+const int AUDIO_THRESHOLD = 50;            // Próg wykrywania audio (wartość ADC)
 unsigned long lastAudioDetectedTime = 0;
 bool audioTimerActive = false;
 unsigned long audioTimerStart = 0;
 const unsigned long AUDIO_TIMER_DURATION = 60000; // 60 sekund
 
-// Parametry temperaturowe
-const float FAN_TEMP_MAX = 40.0;         // Temperatura, przy której przy regulacji PWM osiągamy 255
+const float FAN_TEMP_MAX = 40.0;         // Temperatura, przy której PWM rośnie proporcjonalnie (0–255)
 const float FAN_TEMP_MAX_LIMIT = 50.0;     // Powyżej tej temperatury wentylator pracuje na max (PWM = 255)
-const float TEMP_ALARM_RELEASE = 35.0;     // Temperatura, przy której alarm zostanie wyłączony
+const float TEMP_ALARM_RELEASE = 35.0;     // Temperatura, przy której alarm przegrzania jest resetowany
 
-// Flaga alarmu przegrzania
-bool overTempActive = false;
+// =====================
+// DEFINICJA STRUKTURY STANÓW
+// =====================
+enum SystemState {
+  STATE_ACTIVE,    // Aktywny: system monitoruje napięcie, audio, temperaturę – elementy włączone
+  STATE_IDLE,      // Spoczynek: warunki nie wymagają aktywności (np. wysoki poziom napięcia, audio obecne)
+  STATE_OVERHEAT,  // Awaryjny: temperatura przekracza FAN_TEMP_MAX_LIMIT, włączony alarm
+  STATE_SLEEP      // Uśpienie: system przez długi czas pozostaje bez aktywności, przechodzi w tryb oszczędzania energii
+};
+
+SystemState systemState = STATE_IDLE;
+unsigned long lastActiveTime = 0;  // Czas ostatniej aktywności (dla przejścia w tryb IDLE / SLEEP)
 
 // =====================
 // FUNKCJA MAPOWANIA FLOAT
@@ -74,11 +67,9 @@ int mapFloat(float x, float in_min, float in_max, int out_min, int out_max) {
 }
 
 // =====================
-// FUNKCJA DEBUG
+// FUNKCJA DEBUG STATUSU
 // =====================
 void debugStatus() {
-  // Tutaj można dodać dodatkowe funkcje raportowania np. zapisywanie do EEPROM
-  // lub wysyłanie przez inny interfejs. Na razie wypisujemy tylko podstawowe informacje.
   DEBUG_PRINT("Bateria: ");
   int adcBattery = analogRead(BATTERY_PIN);
   float measuredVoltage = adcBattery * (5.0 / 1023.0);
@@ -91,67 +82,22 @@ void debugStatus() {
   DEBUG_PRINTLN(adcAudio);
 }
 
-void setup() {
-  Serial.begin(9600);
-  
-  // Ustawienie trybów pinów
-  pinMode(BATTERY_PIN, INPUT);
-  pinMode(AUDIO_PIN, INPUT);
-  pinMode(SUBWOOFER_CTRL_PIN, OUTPUT);
-  pinMode(FAN_PWM_PIN, OUTPUT);
-  pinMode(TEMP_ALARM_PIN, OUTPUT);
-  pinMode(LED_ALARM_PIN, OUTPUT);
-  
-  // Upewnij się, że wyjścia są na początku wyłączone
-  digitalWrite(SUBWOOFER_CTRL_PIN, LOW);
-  digitalWrite(TEMP_ALARM_PIN, LOW);
-  digitalWrite(LED_ALARM_PIN, LOW);
-  analogWrite(FAN_PWM_PIN, 0);
-  
-  // Inicjalizacja czujnika DS18B20
-  sensors.begin();
-  
-  // Inicjalizacja czasu ostatniego wykrycia audio
-  lastAudioDetectedTime = millis();
-  
-  // ===============================
-  // Inicjalizacja Watchdoga
-  // ===============================
-  // Ustaw watchdog na okres 2 sekund. Jeżeli w ciągu 2 sekund watchdog nie zostanie zresetowany,
-  // nastąpi reset mikrokontrolera.
-  wdt_enable(WDTO_2S);
-  
-  DEBUG_PRINTLN("System uruchomiony - debugowanie wlaczone");
-}
-
-void loop() {
-  // Reset watchdoga na początku każdej iteracji pętli
-  wdt_reset();
-  
+// =====================
+// FUNKCJA AKTUALIZACJI STANU SYSTEMU
+// =====================
+void updateSystemState() {
   unsigned long currentTime = millis();
 
-  // ============
-  // 1. POMIAR NAPIĘCIA AKAUMULATORA
-  // ============
+  // Pomiar napięcia akumulatora
   int adcBattery = analogRead(BATTERY_PIN);
   float measuredVoltage = adcBattery * (5.0 / 1023.0);
   float batteryVoltage = measuredVoltage * VOLTAGE_DIVIDER_FACTOR;
-  
-  DEBUG_PRINT("Napiecie akumulatora: ");
-  DEBUG_PRINT(batteryVoltage);
-  DEBUG_PRINTLN(" V");
-
-  // Warunek niskiego napięcia: TRUE, gdy napięcie < 12V
   bool batteryLow = (batteryVoltage < BATTERY_LOW_THRESHOLD);
 
-  // ============
-  // 2. WYKRYWANIE SYGNAŁU AUDIO
-  // ============
+  // Pomiar sygnału audio
   int adcAudio = analogRead(AUDIO_PIN);
-  DEBUG_PRINT("Audio ADC: ");
-  DEBUG_PRINTLN(adcAudio);
-  
   bool audioPresent = (adcAudio > AUDIO_THRESHOLD);
+  
   if (audioPresent) {
     lastAudioDetectedTime = currentTime;
     audioTimerActive = false;
@@ -167,66 +113,169 @@ void loop() {
     }
   }
   
-  // System aktywny, gdy napięcie jest niskie LUB brak audio przez 60s
-  bool systemActive = batteryLow || audioTimerActive;
-  digitalWrite(SUBWOOFER_CTRL_PIN, systemActive ? HIGH : LOW);
-
-  // ============
-  // 3. POMIAR TEMPERATURY I STEROWANIE WENTYLATOREM
-  // ============
-  if (systemActive) {
-    sensors.requestTemperatures();
-    float temperature = sensors.getTempCByIndex(0);
-    DEBUG_PRINT("Temperatura: ");
-    DEBUG_PRINT(temperature);
-    DEBUG_PRINTLN(" *C");
-    
-    int fanPWM = 0;
-    if (temperature <= FAN_TEMP_MAX) {
-      fanPWM = mapFloat(temperature, 0.0, FAN_TEMP_MAX, 0, 255);
-    } else {
-      fanPWM = 255;
-    }
-    analogWrite(FAN_PWM_PIN, fanPWM);
-    
-    // ============
-    // 4. ZABEZPIECZENIE PRZECIWKO PRZEGRZANIU
-    // ============
-    if (temperature > FAN_TEMP_MAX_LIMIT) {
-      digitalWrite(TEMP_ALARM_PIN, HIGH);
-      overTempActive = true;
-    } else if (overTempActive && temperature < TEMP_ALARM_RELEASE) {
-      digitalWrite(TEMP_ALARM_PIN, LOW);
-      overTempActive = false;
-    }
-    
-    // Sygnalizacja LED: w trybie awaryjnym (przegrzanie) zapal diodę LED (migająca)
-    if (overTempActive) {
-      if ((currentTime / 500) % 2 == 0)
-        digitalWrite(LED_ALARM_PIN, HIGH);
-      else
-        digitalWrite(LED_ALARM_PIN, LOW);
-    } else {
-      digitalWrite(LED_ALARM_PIN, LOW);
-    }
-    
-    DEBUG_PRINT("Fan PWM: ");
-    DEBUG_PRINT(fanPWM);
-    DEBUG_PRINT(" | Alarm: ");
-    DEBUG_PRINTLN(digitalRead(TEMP_ALARM_PIN));
-  } else {
-    analogWrite(FAN_PWM_PIN, 0);
-    digitalWrite(TEMP_ALARM_PIN, LOW);
-    digitalWrite(LED_ALARM_PIN, LOW);
+  // Ustal warunek aktywności – gdy napięcie jest niskie lub brak audio
+  bool activeCondition = batteryLow || audioTimerActive;
+  
+  // Jeśli warunki aktywne są spełnione, ustaw stan ACTIVE i resetuj timer bezczynności
+  if (activeCondition) {
+    systemState = STATE_ACTIVE;
+    lastActiveTime = currentTime;
+  } 
+  // Jeśli system był aktywny, ale przez 30 sekund nie wykryto aktywności, przechodzi w stan IDLE
+  else if (currentTime - lastActiveTime > 30000) {
+    systemState = STATE_IDLE;
   }
   
-  // Możliwość dodatkowego raportowania stanu systemu
-  #if DEBUG
-    // Na przykład, wywołanie funkcji debugStatus() co kilka sekund:
-    if (currentTime % 5000 < 200) {  // co około 5 sekund
-      debugStatus();
-    }
-  #endif
+  // Jeśli temperatura przekracza granicę, ustaw stan OVERHEAT (ma priorytet)
+  sensors.requestTemperatures();
+  float temperature = sensors.getTempCByIndex(0);
+  if (temperature > FAN_TEMP_MAX_LIMIT) {
+    systemState = STATE_OVERHEAT;
+  }
   
-  delay(200);  // pętla musi wykonywać się częściej niż co 2 sekundy, aby watchdog był resetowany
+  // Jeśli system jest przez długi czas (np. 2 minuty) w stanie IDLE, przejdź do trybu SLEEP
+  if (systemState == STATE_IDLE && (currentTime - lastActiveTime > 120000)) {
+    systemState = STATE_SLEEP;
+  }
+  
+  // Debug: wypisz aktualny stan systemu
+  switch(systemState) {
+    case STATE_ACTIVE:
+      DEBUG_PRINTLN("Stan systemu: ACTIVE");
+      break;
+    case STATE_IDLE:
+      DEBUG_PRINTLN("Stan systemu: IDLE");
+      break;
+    case STATE_OVERHEAT:
+      DEBUG_PRINTLN("Stan systemu: OVERHEAT");
+      break;
+    case STATE_SLEEP:
+      DEBUG_PRINTLN("Stan systemu: SLEEP");
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Konfiguracja pinów
+  pinMode(BATTERY_PIN, INPUT);
+  pinMode(AUDIO_PIN, INPUT);
+  pinMode(SUBWOOFER_CTRL_PIN, OUTPUT);
+  pinMode(FAN_PWM_PIN, OUTPUT);
+  pinMode(TEMP_ALARM_PIN, OUTPUT);
+  pinMode(LED_ALARM_PIN, OUTPUT);
+  
+  // Upewnij się, że na starcie wszystkie wyjścia są wyłączone
+  digitalWrite(SUBWOOFER_CTRL_PIN, LOW);
+  digitalWrite(TEMP_ALARM_PIN, LOW);
+  digitalWrite(LED_ALARM_PIN, LOW);
+  analogWrite(FAN_PWM_PIN, 0);
+  
+  sensors.begin();
+  lastAudioDetectedTime = millis();
+  lastActiveTime = millis();
+  
+  // Inicjalizacja Watchdoga – ustawiony na 2 sekundy
+  wdt_enable(WDTO_2S);
+  
+  DEBUG_PRINTLN("System uruchomiony - debugowanie wlaczone");
+}
+
+void loop() {
+  // Resetuj watchdog
+  wdt_reset();
+  
+  unsigned long currentTime = millis();
+  
+  // Aktualizuj stan systemu (napięcie, audio, temperatura)
+  updateSystemState();
+  
+  // Wykonaj zadania w zależności od aktualnego stanu:
+  switch(systemState) {
+    case STATE_ACTIVE:
+      {
+        // Aktywne działanie: włącz subwoofer
+        digitalWrite(SUBWOOFER_CTRL_PIN, HIGH);
+        
+        // Pomiar temperatury i sterowanie wentylatorem
+        sensors.requestTemperatures();
+        float temperature = sensors.getTempCByIndex(0);
+        int fanPWM = (temperature <= FAN_TEMP_MAX) ?
+                      mapFloat(temperature, 0.0, FAN_TEMP_MAX, 0, 255) : 255;
+        analogWrite(FAN_PWM_PIN, fanPWM);
+        
+        // Zabezpieczenie przed przegrzaniem
+        if (temperature > FAN_TEMP_MAX_LIMIT) {
+          digitalWrite(TEMP_ALARM_PIN, HIGH);
+        } else if (temperature < TEMP_ALARM_RELEASE) {
+          digitalWrite(TEMP_ALARM_PIN, LOW);
+        }
+        
+        // Sygnalizacja LED: w trybie OVERHEAT migająca dioda
+        if (temperature > FAN_TEMP_MAX_LIMIT) {
+          if ((currentTime / 500) % 2 == 0)
+            digitalWrite(LED_ALARM_PIN, HIGH);
+          else
+            digitalWrite(LED_ALARM_PIN, LOW);
+        } else {
+          digitalWrite(LED_ALARM_PIN, LOW);
+        }
+        
+        DEBUG_PRINT("Temperatura: ");
+        DEBUG_PRINT(temperature);
+        DEBUG_PRINTLN(" *C");
+        DEBUG_PRINT("Fan PWM: ");
+        DEBUG_PRINT(fanPWM);
+        DEBUG_PRINT(" | Alarm: ");
+        DEBUG_PRINTLN(digitalRead(TEMP_ALARM_PIN));
+      }
+      break;
+      
+    case STATE_OVERHEAT:
+      {
+        // W trybie OVERHEAT – alarm pozostaje włączony, subwoofer włączony, wentylator wyłączony (dla ochrony)
+        digitalWrite(TEMP_ALARM_PIN, HIGH);
+        digitalWrite(SUBWOOFER_CTRL_PIN, HIGH);
+        analogWrite(FAN_PWM_PIN, 0);
+        if ((currentTime / 500) % 2 == 0)
+          digitalWrite(LED_ALARM_PIN, HIGH);
+        else
+          digitalWrite(LED_ALARM_PIN, LOW);
+      }
+      break;
+      
+    case STATE_IDLE:
+      {
+        // W stanie IDLE wyłączamy wszystkie aktywne elementy
+        digitalWrite(SUBWOOFER_CTRL_PIN, LOW);
+        digitalWrite(TEMP_ALARM_PIN, LOW);
+        digitalWrite(LED_ALARM_PIN, LOW);
+        analogWrite(FAN_PWM_PIN, 0);
+      }
+      break;
+      
+    case STATE_SLEEP:
+      {
+        // W trybie SLEEP: oszczędzanie energii
+        digitalWrite(SUBWOOFER_CTRL_PIN, LOW);
+        digitalWrite(TEMP_ALARM_PIN, LOW);
+        digitalWrite(LED_ALARM_PIN, LOW);
+        analogWrite(FAN_PWM_PIN, 0);
+        DEBUG_PRINTLN("Przechodze w tryb sleep (8 sekund)...");
+        // Uśpij mikrokontroler na 8 sekund; ADC oraz BOD zostają wyłączone dla niższego poboru prądu.
+        LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+        // Po przebudzeniu wracamy do stanu IDLE, resetujemy timer aktywności.
+        systemState = STATE_IDLE;
+        lastActiveTime = millis();
+      }
+      break;
+  }
+  
+  // Dodatkowe debugowanie (np. co około 5 sekund)
+  if (currentTime % 5000 < 200) {
+    debugStatus();
+  }
+  
+  delay(200); // Pętla musi wykonywać się wystarczająco często, aby watchdog był resetowany
 }
